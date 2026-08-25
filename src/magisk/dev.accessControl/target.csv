@@ -1,0 +1,3 @@
+package,domain,target,permissions
+# com.example.reader,ac_example_reader,/data/local/tmp/private.txt,read
+# com.example.editor,ac_example_editor,/data/local/tmp/private,read|write

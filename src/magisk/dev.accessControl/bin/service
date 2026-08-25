@@ -1,0 +1,216 @@
+#!/system/bin/sh
+
+# The Magisk service entrypoint. All policy generation and runtime state is
+# intentionally kept here; reusable parsing and logging live in lib/.
+SCRIPT_DIR=${0%/*}
+MODULE_DIR=${SCRIPT_DIR%/*}
+
+# shellcheck source=../lib/common.sh
+. "$MODULE_DIR/lib/common.sh"
+# shellcheck source=../lib/config.sh
+. "$MODULE_DIR/lib/config.sh"
+# shellcheck source=../lib/rules.sh
+. "$MODULE_DIR/lib/rules.sh"
+
+usage() {
+    cat <<'EOF'
+Usage: bin/service <command>
+
+Commands:
+  init       Create persistent configuration files when absent
+  prepare    Validate, load policy, and build the boot-time app-domain map
+  apply      Force-load the current rules into the live SELinux policy
+  reload     Action-button reload; requires DYNAMIC_LOAD=1
+  check      Validate configuration and generate a policy preview only
+  status     Print current module status
+EOF
+}
+
+init_config() {
+    umask 077
+    mkdir -p "$CONFIG_DIR" "$RUNTIME_DIR" || return 1
+    chmod 0700 "$CONFIG_DIR" "$RUNTIME_DIR" 2>/dev/null || true
+
+    if [ ! -f "$CONFIG_FILE" ]; then
+        cp -p "$MODULE_DIR/default.conf" "$CONFIG_FILE" || return 1
+        ac_log info "created $CONFIG_FILE"
+    fi
+
+    if [ ! -f "$TARGET_FILE" ]; then
+        cp -p "$MODULE_DIR/target.csv" "$TARGET_FILE" || return 1
+        ac_log info "created $TARGET_FILE"
+    fi
+}
+
+remove_seapp_overlay() {
+    if [ -f "$SEAPP_OVERLAY" ]; then
+        rm -f "$SEAPP_OVERLAY"
+    fi
+}
+
+install_seapp_overlay() {
+    generated=$1
+    mappings=$2
+
+    if [ "$mappings" -eq 0 ]; then
+        remove_seapp_overlay
+        return 0
+    fi
+
+    mkdir -p "${SEAPP_OVERLAY%/*}" || return 1
+    cp -p "$generated" "$SEAPP_OVERLAY" || return 1
+    chmod 0644 "$SEAPP_OVERLAY" 2>/dev/null || true
+}
+
+apply_policy() {
+    phase=${1:-runtime}
+    APPLY_PHASE=$phase
+
+    init_config || {
+        [ "$phase" = boot ] && remove_seapp_overlay
+        ac_log error "cannot initialize persistent configuration"
+        return 1
+    }
+    load_config || {
+        [ "$phase" = boot ] && remove_seapp_overlay
+        return 1
+    }
+
+    acquire_apply_lock || {
+        [ "$phase" = boot ] && remove_seapp_overlay
+        ac_log warn "another policy update is already running"
+        return 1
+    }
+    trap 'release_apply_lock' EXIT HUP INT TERM
+
+    generate_rules || {
+        [ "$phase" = boot ] && remove_seapp_overlay
+        ac_log error "configuration rejected; no rules were loaded"
+        release_apply_lock
+        trap - EXIT HUP INT TERM
+        return 1
+    }
+
+    if [ "$DOMAIN_MAPPINGS" -gt 0 ]; then
+        if [ "${AC_DRY_RUN:-0}" = 1 ]; then
+            ac_log info "dry run: skipped live policy update"
+        elif ! command -v "$MAGISKPOLICY" >/dev/null 2>&1; then
+            [ "$phase" = boot ] && remove_seapp_overlay
+            ac_log error "magiskpolicy executable not found: $MAGISKPOLICY"
+            release_apply_lock
+            trap - EXIT HUP INT TERM
+            return 1
+        elif ! "$MAGISKPOLICY" --live --apply "$GENERATED_POLICY" >>"$LOG_FILE" 2>&1; then
+            [ "$phase" = boot ] && remove_seapp_overlay
+            ac_log error "magiskpolicy rejected the generated policy"
+            release_apply_lock
+            trap - EXIT HUP INT TERM
+            return 1
+        fi
+    fi
+
+    if ! install_seapp_overlay "$GENERATED_SEAPP" "$DOMAIN_MAPPINGS"; then
+        remove_seapp_overlay
+        ac_log error "failed to install the generated seapp_contexts overlay"
+        release_apply_lock
+        trap - EXIT HUP INT TERM
+        return 1
+    fi
+
+    new_hash=$(configuration_hash)
+    old_hash=
+    [ -f "$APPLIED_HASH_FILE" ] && old_hash=$(sed -n '1p' "$APPLIED_HASH_FILE")
+    if [ "$phase" = runtime ] && [ -n "$old_hash" ] && [ "$old_hash" != "$new_hash" ]; then
+        : >"$REBOOT_REQUIRED_FILE"
+        ac_log warn "runtime rules changed; removed or relaxed denies and new package-domain mappings require reboot"
+    fi
+
+    printf '%s\n' "$new_hash" >"$APPLIED_HASH_FILE"
+    printf '%s\n' "$ACTIVE_RULES" >"$ACTIVE_COUNT_FILE"
+    if [ "$PENDING_RULES" -gt 0 ]; then
+        printf '%s\n' "$PENDING_RULES" >"$PENDING_COUNT_FILE"
+    else
+        rm -f "$PENDING_COUNT_FILE"
+    fi
+    [ "$phase" = boot ] && rm -f "$REBOOT_REQUIRED_FILE"
+
+    ac_log info "loaded $ACTIVE_RULES rule(s); pending targets: $PENDING_RULES"
+    release_apply_lock
+    trap - EXIT HUP INT TERM
+}
+
+check_config() {
+    APPLY_PHASE=check
+    init_config || return 1
+    load_config || return 1
+    generate_rules || return 1
+    printf 'valid rules: %s\n' "$ACTIVE_RULES"
+    printf 'pending targets: %s\n' "$PENDING_RULES"
+    printf 'domain mappings: %s\n' "$DOMAIN_MAPPINGS"
+    printf 'policy preview: %s\n' "$GENERATED_POLICY"
+    printf 'seapp preview: %s\n' "$GENERATED_SEAPP"
+}
+
+reload_policy() {
+    init_config || return 1
+    load_config || return 1
+
+    if [ "$DYNAMIC_LOAD" != 1 ]; then
+        ac_log info "action reload skipped because DYNAMIC_LOAD=0"
+        printf 'Dynamic loading is disabled; changes will be applied at next boot.\n'
+        return 2
+    fi
+
+    apply_policy runtime
+}
+
+print_status() {
+    init_config >/dev/null 2>&1 || true
+    load_config >/dev/null 2>&1 || true
+
+    active=0
+    pending=0
+    [ -f "$ACTIVE_COUNT_FILE" ] && active=$(sed -n '1p' "$ACTIVE_COUNT_FILE")
+    [ -f "$PENDING_COUNT_FILE" ] && pending=$(sed -n '1p' "$PENDING_COUNT_FILE")
+
+    printf 'config_dir=%s\n' "$CONFIG_DIR"
+    printf 'dynamic_load=%s\n' "$DYNAMIC_LOAD"
+    printf 'dynamic_trigger=magisk_action\n'
+    printf 'active_rules=%s\n' "$active"
+    printf 'pending_rules=%s\n' "$pending"
+    if [ -f "$REBOOT_REQUIRED_FILE" ]; then
+        printf 'reboot_required=yes\n'
+    else
+        printf 'reboot_required=no\n'
+    fi
+    printf 'log=%s\n' "$LOG_FILE"
+}
+
+command_name=${1:-status}
+case "$command_name" in
+    init)
+        init_config
+        ;;
+    prepare)
+        apply_policy boot
+        ;;
+    apply)
+        apply_policy runtime
+        ;;
+    reload)
+        reload_policy
+        ;;
+    check)
+        check_config
+        ;;
+    status)
+        print_status
+        ;;
+    help | -h | --help)
+        usage
+        ;;
+    *)
+        usage >&2
+        exit 2
+        ;;
+esac

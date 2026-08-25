@@ -1,0 +1,3 @@
+# Rules are generated from /data/adb/dev.accessControl/target.csv and loaded by
+# bin/service through `magiskpolicy --live --apply`. This file intentionally has
+# no static policy statements.

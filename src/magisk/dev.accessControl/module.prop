@@ -1,0 +1,6 @@
+id=dev.accessControl
+name=accessControl
+version=0.1.1
+versionCode=11
+author=OOO12e3
+description=Config-driven SELinux file access control with guarded live testing
